@@ -1,0 +1,364 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// Gerchik-style level trading helper: daily levels, ATR filter, trade plan, entry-model signals.
+//@version=6
+indicator("Gerchik Levels", shorttitle = "GLevels", overlay = true, max_lines_count = 200, max_labels_count = 200, max_bars_back = 500)
+
+// ───────────────────────── Inputs
+grpL = "Levels (from daily chart)"
+pivL       = input.int(2, "Pivot bars left", minval = 1, group = grpL)
+pivR       = input.int(2, "Pivot bars right", minval = 1, group = grpL)
+histBars   = input.int(130, "Daily bars of history (130 ≈ 6 months, same as the scanner)", minval = 30, maxval = 300, group = grpL)
+clusterK   = input.float(0.2, "Merge pivots closer than (× ATR)", step = 0.05, group = grpL)
+roundStep  = input.float(0.5, "Round-number step (0.5 for stocks, 0.005 for FX)", step = 0.005, group = grpL)
+minScore   = input.int(3, "Min level score to use", minval = 1, group = grpL)
+maxBreaks  = input.int(7, "Drop levels broken this many times", minval = 1, group = grpL, tooltip = "Breaks = daily closes crossing the level since its first touch")
+nLevels    = input.int(2, "Levels drawn above / below price", minval = 1, maxval = 10, group = grpL)
+
+grpR = "Risk (course rules)"
+atrLen  = input.int(7, "Daily ATR length (abnormal bars excluded)", minval = 3, group = grpR)
+stopPct = input.float(10, "Stop, % of daily ATR", step = 1, group = grpR)
+luftPct = input.float(20, "Luft, % of stop", step = 1, group = grpR)
+rr      = input.float(3, "Min reward : risk", step = 0.5, group = grpR)
+atrLim  = input.float(75, "ATR used today: no trend trades above, %", step = 5, group = grpR)
+
+grpS = "Signals (chart timeframe, use M5–H1)"
+showFB   = input.bool(true, "False breakout (1–2 bars)", group = grpS)
+showBnc  = input.bool(true, "Bounce (two touches within luft)", group = grpS)
+showSq   = input.bool(true, "Breakout squeeze (small bars into level)", group = grpS)
+showAppr = input.bool(true, "Alert when price approaches a level", group = grpS)
+sigDays  = input.int(3, "Show signals for the last N days", minval = 1, maxval = 60, group = grpS)
+sigScore = input.int(5, "Signals only at levels with score ≥", minval = 1, group = grpS)
+sigDaily = input.bool(false, "Also show signals on Daily and higher charts", group = grpS, tooltip = "Entry models are meant for M5–H1. On the daily chart they mark almost every candle.")
+
+grpV = "Display"
+showPlan  = input.bool(true, "Trade plan lines", group = grpV)
+showPanel = input.bool(true, "Info panel", group = grpV)
+colS = input.color(color.teal, "Support", group = grpV)
+colR = input.color(color.red, "Resistance", group = grpV)
+colM = input.color(color.orange, "Mirror level", group = grpV)
+
+// ───────────────────────── Daily data (non-repainting: completed daily bars only)
+f_atr(n) =>
+    tr  = ta.tr(true)
+    med = ta.percentile_nearest_rank(tr, 30, 50)
+    float s = 0.0
+    int   c = 0
+    for i = 0 to 29
+        if c < n and tr[i] < 2 * med
+            s += tr[i]
+            c += 1
+    c > 0 ? s / c : tr
+
+f_daily() =>
+    a   = f_atr(atrLen)
+    sma = ta.sma(close, 50)
+    [a[1], close[1], sma[1], sma[11], close[6]]
+
+[dATR, prevC, sma50, sma50p, close5] = request.security(syminfo.tickerid, "D", f_daily(), lookahead = barmerge.lookahead_on)
+
+// ───────────────────────── Levels, built in the daily context so every chart timeframe
+// sees the full daily history (a 5m chart only loads a few weeks of bars).
+f_isRound(p, a) =>
+    roundStep > 0 and math.abs(p - math.round(p / roundStep) * roundStep) < 0.05 * a
+
+f_breaks(dC, dCT, lp, t0) =>
+    int   b    = 0
+    float side = 0.0
+    for k = 0 to array.size(dC) - 1
+        if array.get(dCT, k) >= t0
+            s = math.sign(array.get(dC, k) - lp)
+            if s != 0
+                if side != 0 and s != side
+                    b += 1
+                side := s
+    b
+
+// Runs on daily bars. Uses only data up to the previous daily bar, so intraday bars never see the future.
+f_levels() =>
+    var pP  = array.new<float>()   // pivot prices
+    var pK  = array.new<int>()     // 1 = pivot high, -1 = pivot low
+    var pT  = array.new<int>()     // pivot times
+    var pI  = array.new<int>()     // pivot bar index
+    var dC  = array.new<float>()   // daily closes, for counting breaks
+    var dCT = array.new<int>()
+    ph = ta.pivothigh(high, pivL, pivR)
+    pl = ta.pivotlow(low, pivL, pivR)
+    aNow = f_atr(atrLen)
+    a    = aNow[1]
+    if not na(ph[1])
+        array.push(pP, ph[1])
+        array.push(pK, 1)
+        array.push(pT, time[pivR + 1])
+        array.push(pI, bar_index - pivR - 1)
+    if not na(pl[1])
+        array.push(pP, pl[1])
+        array.push(pK, -1)
+        array.push(pT, time[pivR + 1])
+        array.push(pI, bar_index - pivR - 1)
+    // keep pivots from the last histBars completed daily bars
+    while array.size(pI) > 0 and array.get(pI, 0) < bar_index - histBars
+        array.shift(pP)
+        array.shift(pK)
+        array.shift(pT)
+        array.shift(pI)
+    if not na(close[1])
+        array.push(dC, close[1])
+        array.push(dCT, time[1])
+        if array.size(dC) > histBars
+            array.shift(dC)
+            array.shift(dCT)
+    lvP = array.new<float>()   // price (ascending)
+    lvS = array.new<int>()     // score
+    lvM = array.new<bool>()    // mirror (acted as support and resistance)
+    lvT = array.new<int>()     // first touch time
+    lvN = array.new<int>()     // touches
+    lvB = array.new<int>()     // breaks: daily closes crossing the level since its first touch
+    n = array.size(pP)
+    // rebuilding is costly: only for the last ~3 months of daily bars
+    if n > 0 and not na(a) and time >= timenow - 90 * 86400000
+        idx = array.sort_indices(pP, order.ascending)
+        float sum   = 0.0
+        int   cnt   = 0
+        bool  hasR  = false
+        bool  hasS  = false
+        int   tMin  = 0
+        float lastP = 0.0
+        for j = 0 to n
+            bool  atEnd = j == n
+            float p     = 0.0
+            if not atEnd
+                p := array.get(pP, array.get(idx, j))
+            if cnt > 0 and (atEnd or p - lastP > clusterK * a)
+                lp  = sum / cnt
+                mir = hasR and hasS
+                brk = f_breaks(dC, dCT, lp, tMin)
+                // a level broken maxBreaks+ times is "floating" (course) -> drop; each break after the first costs a point
+                if brk < maxBreaks
+                    sc = cnt + (mir ? 2 : 0) + (f_isRound(lp, a) ? 1 : 0) - math.max(0, brk - 1)
+                    array.push(lvP, lp)
+                    array.push(lvS, sc)
+                    array.push(lvM, mir)
+                    array.push(lvT, tMin)
+                    array.push(lvN, cnt)
+                    array.push(lvB, brk)
+                sum  := 0.0
+                cnt  := 0
+                hasR := false
+                hasS := false
+                tMin := 0
+            if not atEnd
+                i = array.get(idx, j)
+                t = array.get(pT, i)
+                sum   += p
+                cnt   += 1
+                hasR  := hasR or array.get(pK, i) == 1
+                hasS  := hasS or array.get(pK, i) == -1
+                tMin  := tMin == 0 ? t : math.min(tMin, t)
+                lastP := p
+    [lvP, lvS, lvM, lvT, lvN, lvB]
+
+[lvP, lvS, lvM, lvT, lvN, lvB] = request.security(syminfo.tickerid, "D", f_levels(), lookahead = barmerge.lookahead_on)
+
+// Nearest usable support (<= px) and resistance (> px)
+f_nearest(px) =>
+    float sup  = na
+    float res  = na
+    int   supS = 0
+    int   resS = 0
+    bool  supM = false
+    bool  resM = false
+    n = array.size(lvP)
+    if n > 0
+        for i = 0 to n - 1
+            sc = array.get(lvS, i)
+            if sc >= minScore
+                p = array.get(lvP, i)
+                if p <= px
+                    sup  := p
+                    supS := sc
+                    supM := array.get(lvM, i)
+                else if na(res)
+                    res  := p
+                    resS := sc
+                    resM := array.get(lvM, i)
+    [sup, supS, supM, res, resS, resM]
+
+[sup, supS, supM, res, resS, resM] = f_nearest(close)
+
+// ───────────────────────── Risk numbers
+stopSz = math.max(syminfo.mintick, math.round_to_mintick(dATR * stopPct / 100))
+luft   = math.max(syminfo.mintick, math.round_to_mintick(stopSz * luftPct / 100))
+
+var float dH = na
+var float dL = na
+if timeframe.change("D")
+    dH := high
+    dL := low
+else
+    dH := math.max(nz(dH, high), high)
+    dL := math.min(nz(dL, low), low)
+atrUsed = na(prevC) or na(dATR) ? na : (math.max(dH, prevC) - math.min(dL, prevC)) / dATR * 100
+tooFar  = atrUsed > atrLim
+
+trendG = close > sma50 and sma50 > sma50p ? "Up" : close < sma50 and sma50 < sma50p ? "Down" : "Flat"
+trendL = close > close5 ? "Up" : "Down"
+
+roomUp  = na(sup) or na(res) ? na : (res - (sup + luft)) / stopSz
+roomDn  = na(sup) or na(res) ? na : ((res - luft) - sup) / stopSz
+longOk  = not na(roomUp) and roomUp >= rr and trendG != "Down"
+shortOk = not na(roomDn) and roomDn >= rr and trendG != "Up"
+
+// ───────────────────────── Entry-model signals (chart timeframe)
+bool fbL = false
+bool fbS = false
+bool bnL = false
+bool bnS = false
+bool sqL = false
+bool sqS = false
+bool apS = false
+bool apR = false
+
+avgRng   = ta.sma(high - low, 20)
+smallBar = ta.highest(high - low, 3) < 0.6 * avgRng
+
+sigTf  = sigDaily or timeframe.isintraday
+recent = time >= last_bar_time - sigDays * 86400000
+if sigTf and recent and not na(dATR)
+    if not na(sup) and supS >= sigScore
+        // false breakout down through support: pierce and close back above (1 bar) or close below then back above (2 bars)
+        fbL := showFB and close > sup and (low < sup - luft or (close[1] < sup and low[1] < sup))
+        // bounce: two consecutive bars touch support within luft and close above it
+        bnL := showBnc and not fbL and math.abs(low - sup) <= luft and math.abs(low[1] - sup) <= luft and close > sup and close[1] > sup
+        // squeeze into support from above (breakdown setup)
+        sqS := showSq and smallBar and low - sup <= stopSz and close > sup and high < high[2]
+        apS := showAppr and close - sup <= stopSz and close[1] - sup > stopSz
+    if not na(res) and resS >= sigScore
+        fbS := showFB and close < res and (high > res + luft or (close[1] > res and high[1] > res))
+        bnS := showBnc and not fbS and math.abs(high - res) <= luft and math.abs(high[1] - res) <= luft and close < res and close[1] < res
+        sqL := showSq and smallBar and res - high <= stopSz and close < res and low > low[2]
+        apR := showAppr and res - close <= stopSz and res - close[1] > stopSz
+
+// one marker per side per day: the first model at a level is the one that matters
+var bool longDone  = false
+var bool shortDone = false
+if timeframe.change("D")
+    longDone  := false
+    shortDone := false
+if longDone
+    fbL := false
+    bnL := false
+    sqS := false
+if shortDone
+    fbS := false
+    bnS := false
+    sqL := false
+longDone  := longDone or fbL or bnL or sqS
+shortDone := shortDone or fbS or bnS or sqL
+
+plotshape(fbL, "False breakout → long", shape.triangleup, location.belowbar, colS, text = "FB", size = size.small)
+plotshape(fbS, "False breakout → short", shape.triangledown, location.abovebar, colR, text = "FB", size = size.small)
+plotshape(bnL, "Bounce long", shape.circle, location.belowbar, colS, text = "B", size = size.tiny)
+plotshape(bnS, "Bounce short", shape.circle, location.abovebar, colR, text = "B", size = size.tiny)
+plotshape(sqL, "Squeeze → breakout up", shape.diamond, location.abovebar, color.blue, text = "SQ", size = size.tiny)
+plotshape(sqS, "Squeeze → breakdown", shape.diamond, location.belowbar, color.purple, text = "SQ", size = size.tiny)
+
+fmt(x) => str.tostring(x, format.mintick)
+note = tooFar ? " | ATR used " + str.tostring(atrUsed, "#") + "% – counter-trend only" : ""
+if fbL
+    alert(syminfo.ticker + " false breakout of support " + fmt(sup) + " → long, buy-stop " + fmt(sup + luft) + ", stop " + fmt(sup + luft - stopSz) + note, alert.freq_once_per_bar_close)
+if fbS
+    alert(syminfo.ticker + " false breakout of resistance " + fmt(res) + " → short, sell-stop " + fmt(res - luft) + ", stop " + fmt(res - luft + stopSz) + note, alert.freq_once_per_bar_close)
+if bnL
+    alert(syminfo.ticker + " bounce model at support " + fmt(sup) + ": buy limit " + fmt(sup + luft) + ", stop " + fmt(sup + luft - stopSz) + note, alert.freq_once_per_bar_close)
+if bnS
+    alert(syminfo.ticker + " bounce model at resistance " + fmt(res) + ": sell limit " + fmt(res - luft) + ", stop " + fmt(res - luft + stopSz) + note, alert.freq_once_per_bar_close)
+if sqL
+    alert(syminfo.ticker + " squeeze under resistance " + fmt(res) + ": breakout buy-stop " + fmt(res + luft) + note, alert.freq_once_per_bar_close)
+if sqS
+    alert(syminfo.ticker + " squeeze above support " + fmt(sup) + ": breakdown sell-stop " + fmt(sup - luft) + note, alert.freq_once_per_bar_close)
+if apS
+    alert(syminfo.ticker + " approaching support " + fmt(sup) + " (score " + str.tostring(supS) + ")", alert.freq_once_per_bar_close)
+if apR
+    alert(syminfo.ticker + " approaching resistance " + fmt(res) + " (score " + str.tostring(resS) + ")", alert.freq_once_per_bar_close)
+
+// ───────────────────────── Drawing (last bar only)
+var lns = array.new<line>()
+var lbs = array.new<label>()
+
+f_drawLevel(i) =>
+    p   = array.get(lvP, i)
+    sc  = array.get(lvS, i)
+    mir = array.get(lvM, i)
+    c   = mir ? colM : p <= close ? colS : colR
+    st  = sc >= 5 ? line.style_solid : line.style_dashed
+    array.push(lns, line.new(array.get(lvT, i), p, time, p, xloc = xloc.bar_time, extend = extend.right, color = color.new(c, 15), style = st, width = sc >= 6 ? 2 : 1))
+    txt = fmt(p) + " · s" + str.tostring(sc) + (mir ? " M" : "")
+    tip = "score " + str.tostring(sc) + " · " + str.tostring(array.get(lvN, i)) + " touches · " + str.tostring(array.get(lvB, i)) + " breaks" + (mir ? " · mirror" : "") + (f_isRound(p, dATR) ? " · round" : "")
+    array.push(lbs, label.new(bar_index + 2, p, txt, style = label.style_label_left, color = color.new(c, 85), textcolor = c, size = size.tiny, tooltip = tip))
+
+f_planLine(y, c, txt) =>
+    array.push(lns, line.new(bar_index + 1, y, bar_index + 14, y, color = c, style = line.style_dotted, width = 2))
+    array.push(lbs, label.new(bar_index + 14, y, txt, style = label.style_label_left, color = color.new(c, 80), textcolor = c, size = size.tiny))
+
+if barstate.islast
+    for l in lns
+        line.delete(l)
+    for b in lbs
+        label.delete(b)
+    array.clear(lns)
+    array.clear(lbs)
+    n = array.size(lvP)
+    if n > 0
+        // first level index above price
+        int k = n
+        for j = 0 to n - 1
+            if array.get(lvP, j) > close
+                k := j
+                break
+        int drawn = 0
+        int i = k - 1
+        while i >= 0 and drawn < nLevels
+            if array.get(lvS, i) >= minScore
+                f_drawLevel(i)
+                drawn += 1
+            i -= 1
+        drawn := 0
+        i := k
+        while i < n and drawn < nLevels
+            if array.get(lvS, i) >= minScore
+                f_drawLevel(i)
+                drawn += 1
+            i += 1
+    if showPlan and longOk
+        eL = sup + luft
+        f_planLine(eL, color.blue, "Long E " + fmt(eL))
+        f_planLine(eL - stopSz, colR, "Stop " + fmt(eL - stopSz))
+        f_planLine(eL + rr * stopSz, color.green, str.tostring(rr) + "R " + fmt(eL + rr * stopSz))
+    if showPlan and shortOk
+        eS = res - luft
+        f_planLine(eS, color.blue, "Short E " + fmt(eS))
+        f_planLine(eS + stopSz, colR, "Stop " + fmt(eS + stopSz))
+        f_planLine(eS - rr * stopSz, color.green, str.tostring(rr) + "R " + fmt(eS - rr * stopSz))
+
+// ───────────────────────── Info panel
+var table tb = table.new(position.top_right, 2, 13, bgcolor = color.new(color.black, 20), border_width = 1)
+
+f_row(r, k, v, c) =>
+    table.cell(tb, 0, r, k, text_color = color.silver, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tb, 1, r, v, text_color = c, text_size = size.tiny, text_halign = text.align_right)
+
+if barstate.islast and showPanel
+    f_row(0, "Gerchik Levels", syminfo.ticker + " · " + timeframe.period, color.white)
+    f_row(1, "Daily ATR", fmt(dATR) + "  (" + str.tostring(dATR / close * 100, "#.0") + "%)", color.white)
+    f_row(2, "ATR used today", str.tostring(atrUsed, "#") + "%", tooFar ? color.red : atrUsed > 50 ? color.orange : color.lime)
+    f_row(3, "Trend D global / local", trendG + " / " + trendL, trendG == "Up" ? color.lime : trendG == "Down" ? color.red : color.gray)
+    f_row(4, "Stop / luft", fmt(stopSz) + " / " + fmt(luft), color.white)
+    f_row(5, "Resistance", na(res) ? "—" : fmt(res) + "  s" + str.tostring(resS) + (resM ? " M" : ""), colR)
+    f_row(6, "Support", na(sup) ? "—" : fmt(sup) + "  s" + str.tostring(supS) + (supM ? " M" : ""), colS)
+    f_row(7, "Room long (support→res)", na(roomUp) ? "—" : str.tostring(roomUp, "#.0") + " R", longOk ? color.lime : color.red)
+    f_row(8, "Room short (res→support)", na(roomDn) ? "—" : str.tostring(roomDn, "#.0") + " R", shortOk ? color.lime : color.red)
+    f_row(9, "Long plan", na(sup) ? "—" : "E " + fmt(sup + luft) + " S " + fmt(sup + luft - stopSz) + " T " + fmt(sup + luft + rr * stopSz), longOk ? color.white : color.gray)
+    f_row(10, "Short plan", na(res) ? "—" : "E " + fmt(res - luft) + " S " + fmt(res - luft + stopSz) + " T " + fmt(res - luft - rr * stopSz), shortOk ? color.white : color.gray)
+    f_row(11, "Status", tooFar ? "ATR > " + str.tostring(atrLim, "#") + "%: counter-trend only" : longOk or shortOk ? "Tradable – wait for model" : "No room for " + str.tostring(rr) + "R – skip", tooFar ? color.red : longOk or shortOk ? color.lime : color.orange)
+    tfTxt = timeframe.isintraday ? (timeframe.in_seconds() <= 3600 ? "Entry chart: watch for FB / B / SQ" : "Use M5–H1 for entries") : "Planning chart: entries on M5–H1"
+    f_row(12, "Timeframe", tfTxt, timeframe.isintraday and timeframe.in_seconds() <= 3600 ? color.lime : color.gray)

@@ -1,0 +1,43 @@
+# Runs the scanner on GitHub's servers and publishes the dashboards to GitHub Pages.
+# Times are UTC. US stocks: 9:30–16:00 ET = 13:30–20:00 UTC in summer (EDT), 14:30–21:00 UTC in winter (EST).
+# GitHub can start scheduled runs 5–20 minutes late, and when it's busy it may skip one.
+name: Scan
+
+on:
+  schedule:
+    - cron: "*/15 13-21 * * 1-5"   # every 15 min through the US session (both summer and winter time)
+    - cron: "15 22 * * 1-5"        # evening scan after the close: tomorrow's setups
+    - cron: "0 */2 * * *"          # crypto (and stocks) every 2 hours the rest of the time
+  workflow_dispatch:               # "Run workflow" button for a manual refresh
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Stocks
+        run: python scanner/scan.py
+      - name: Crypto
+        run: python scanner/scan.py --market crypto
+        continue-on-error: true
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: scanner/output
+      - id: deploy
+        uses: actions/deploy-pages@v4

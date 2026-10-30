@@ -1,0 +1,2 @@
+# Always shown in the crypto dashboard's "Watching" section (Yahoo symbols)
+BTC-USD ETH-USD SOL-USD XRP-USD

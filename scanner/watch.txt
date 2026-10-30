@@ -1,0 +1,3 @@
+# Always shown in the dashboard's "Watching" section, with their nearest levels, setup or not.
+# The 25 setups from the 2026-10-28 scan (before levels broken 5+ times were filtered out).
+UAL YUM MRVL FDX DDOG DAL SCHW SPOT DG ROST FCX NKE ARM ABT INTU MDT BHP AMD ON CVS BSX PFE MS AVGO KMI
