@@ -36,6 +36,9 @@ jobs:
       - name: Crypto
         run: python scanner/scan.py --market crypto
         continue-on-error: true
+      - name: NQ BTC ETH plan
+        run: python scanner/focus.py
+        continue-on-error: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: scanner/output
