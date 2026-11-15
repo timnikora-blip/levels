@@ -1,0 +1,99 @@
+//@version=6
+// First-hour breakout for NQ / MNQ (also works on QQQ). Use it on a 5-minute chart.
+// Rules (backtested, see Strategy_NQ_BTC_ETH.md):
+//   1. 9:30-10:30 ET builds the range. No trades.
+//   2. 10:30-12:00 ET: the first 5-minute close beyond the range, in the direction of the daily trend
+//      (yesterday's close vs its 20-day average) -> enter. Against the trend -> no trade today.
+//   3. Stop = 25% of daily ATR, target = 3R, close by 15:55 ET. One trade a day.
+indicator("NQ First-Hour Breakout", "FHB", overlay = true, max_lines_count = 100, max_labels_count = 100)
+
+stopPct  = input.float(25, "Stop, % of daily ATR", minval = 5, step = 5)
+targetR  = input.float(3, "Target, R", minval = 1, step = 0.5)
+atrLen   = input.int(7, "Daily ATR length")
+smaLen   = input.int(20, "Trend: daily average length")
+tz       = "America/New_York"
+
+// daily values from completed days only (no repainting)
+[dAtr, dClose, dSma] = request.security(syminfo.tickerid, "D", [ta.atr(atrLen)[1], close[1], ta.sma(close, smaLen)[1]], lookahead = barmerge.lookahead_on)
+trend = dClose > dSma ? 1 : -1
+risk  = dAtr * stopPct / 100
+
+inFirst = not na(time(timeframe.period, "0930-1030", tz))
+inEntry = not na(time(timeframe.period, "1030-1200", tz))
+inRth   = not na(time(timeframe.period, "0930-1555", tz))
+newDay  = inFirst and not inFirst[1]
+
+var float fhHi = na
+var float fhLo = na
+var bool  done = false
+var int   pos = 0
+var float entry = na
+var float stop = na
+var float target = na
+
+if newDay
+    fhHi := high
+    fhLo := low
+    done := false
+    pos := 0
+else if inFirst
+    fhHi := math.max(fhHi, high)
+    fhLo := math.min(fhLo, low)
+
+// manage an open signal
+if pos != 0
+    hitStop = pos == 1 ? low <= stop : high >= stop
+    hitTgt  = pos == 1 ? high >= target : low <= target
+    if hitStop
+        label.new(bar_index, stop, "stop", style = label.style_label_left, color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
+        pos := 0
+    else if hitTgt
+        label.new(bar_index, target, "3R ✓", style = label.style_label_left, color = color.new(color.green, 10), textcolor = color.white, size = size.tiny)
+        pos := 0
+    else if not inRth
+        pos := 0
+
+longSig = false
+shortSig = false
+if inEntry and not done and not na(fhHi) and timeframe.isintraday
+    if close > fhHi
+        done := true
+        if trend == 1
+            longSig := true
+    else if close < fhLo
+        done := true
+        if trend == -1
+            shortSig := true
+    if (close > fhHi or close < fhLo) and not (longSig or shortSig)
+        label.new(bar_index, close, "against trend\nno trade", style = label.style_label_down, color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny)
+
+if longSig or shortSig
+    pos := longSig ? 1 : -1
+    entry := close
+    stop := close - pos * risk
+    target := close + pos * targetR * risk
+    label.new(bar_index, close, (longSig ? "LONG " : "SHORT ") + str.tostring(entry, format.mintick) + "\nstop " + str.tostring(stop, format.mintick) + "\ntarget " + str.tostring(target, format.mintick),
+              style = longSig ? label.style_label_up : label.style_label_down, color = longSig ? color.green : color.red, textcolor = color.white, size = size.small)
+    line.new(bar_index, stop, bar_index + 30, stop, color = color.red, style = line.style_dashed)
+    line.new(bar_index, target, bar_index + 30, target, color = color.green, style = line.style_dashed)
+    alert((longSig ? "NQ LONG " : "NQ SHORT ") + "first-hour breakout. Entry ~" + str.tostring(entry, format.mintick) + ", stop " + str.tostring(stop, format.mintick) + ", target " + str.tostring(target, format.mintick), alert.freq_once_per_bar_close)
+
+showRange = inRth and not na(fhHi)
+plot(showRange ? fhHi : na, "First-hour high", color = color.new(color.teal, 0), linewidth = 2, style = plot.style_linebr)
+plot(showRange ? fhLo : na, "First-hour low", color = color.new(color.orange, 0), linewidth = 2, style = plot.style_linebr)
+bgcolor(inFirst ? color.new(color.gray, 90) : na, title = "First hour (no trades)")
+
+alertcondition(longSig, "FHB long", "NQ first-hour breakout LONG")
+alertcondition(shortSig, "FHB short", "NQ first-hour breakout SHORT")
+
+// small panel
+var table t = table.new(position.top_right, 2, 4, bgcolor = color.new(color.black, 80))
+if barstate.islast
+    table.cell(t, 0, 0, "Trend", text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 0, trend == 1 ? "UP: longs only" : "DOWN: shorts only", text_color = trend == 1 ? color.lime : color.red, text_size = size.small)
+    table.cell(t, 0, 1, "Daily ATR", text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 1, str.tostring(dAtr, format.mintick), text_color = color.white, text_size = size.small)
+    table.cell(t, 0, 2, "Stop", text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 2, str.tostring(risk, format.mintick) + " pts", text_color = color.white, text_size = size.small)
+    table.cell(t, 0, 3, "Today", text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 3, done ? (pos != 0 ? "in signal" : "done") : inFirst ? "building range: wait" : inEntry ? "watching 10:30-12:00" : "no entries now", text_color = color.white, text_size = size.small)
